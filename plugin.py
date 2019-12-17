@@ -1,6 +1,10 @@
 # A Python plugin for Domoticz to access AirPurifier 2
 #
-# Author: kofec
+# Authors:
+#  - kofec
+#  - Carck
+#  - l4m3rx
+#
 #
 # TODO: Update text sensors only when changed
 #
@@ -10,11 +14,24 @@
 # aqi=10 temperature=22.9, humidity=35%, mode=OperationMode.Silent, led=True, led_brightness=LedBrightness.Bright,
 # buzzer=False, child_lock=False, brightness=None, favorite_level=10, filter_life_remaining=79,
 # filter_hours_used=717, use_time=2581642, motor_speed=352>
-
+#
 # v0.1.1 - Add initial version of switches, update to nie version of python-miio
 #
+# v0.2.0
+#   - Switch to multiple thread model
+#   - Change command timeout
+#   - Introduce small sleep before update after command
+#   - Update device status directly after command
+#   - Expose LED status and switch to control the LED from domoticz
+#   - Expose Filter statistics to domoticz
+# v0.2.1
+#   - Expose illuminance to domoticz
+# v0.2.2
+#   - Update old version definition in xml
+#   - Fix set_favorite_level. python-miio library expects int not str.
+#
 """
-<plugin key="AirPurifier" name="AirPurifier" author="kofec" version="0.1.1" wikilink="https://github.com/rytilahti/python-miio" externallink="https://github.com/kofec/domoticz-AirPurifier">
+<plugin key="AirPurifier" name="AirPurifier" author="kofec" version="0.2.2" wikilink="https://github.com/rytilahti/python-miio" externallink="https://github.com/kofec/domoticz-AirPurifier">
     <params>
 		<param field="Address" label="IP Address" width="200px" required="true" default="127.0.0.1"/>
 		<param field="Mode1" label="AirPurifier Token" default="" width="400px" required="true"  />
@@ -131,7 +148,7 @@ class BasePlugin:
 
     def __init__(self):
         # Consts
-        self.version = "0.1.1"
+        self.version = "0.2.2"
 
         self.EXCEPTIONS = {
             "SENSOR_NOT_FOUND":     1,
@@ -155,12 +172,17 @@ class BasePlugin:
 
         self.UNIT_LED                   = 20
 
+        self.FILTER_WORK_HOURS          = 21
+        self.FILTER_LIFE_REMAINING      = 22
+
+        self.UNIT_ILLUMINANCE_SENSOR    = 23
+
 
         self.nextpoll = datetime.datetime.now()
         self.messageQueue = queue.Queue()
         self.messageThread = threading.Thread(name="QueueThread", target=BasePlugin.handleMessage, args=(self,))
         return
-    
+
     def handleMessage(self):
         try:
             Domoticz.Debug("Entering message handler")
@@ -196,6 +218,33 @@ class BasePlugin:
         self.pollinterval = int(Parameters["Mode3"]) * 60
 
         self.variables = {
+            self.UNIT_ILLUMINANCE_SENSOR: {
+                "Name":     _("Illuminance sensor"),
+                "TypeName": "Custom",
+                "Options":  {"Custom": "1;%s" % "lux"},
+                "Image":    7,
+                "Used":     1,
+                "nValue":   0,
+                "sValue":   None,
+            },
+            self.FILTER_LIFE_REMAINING: {
+                "Name":     _("Filter life remaining"),
+                "TypeName": "Custom",
+                "Options":  {"Custom": "1;%s" % "%"},
+                "Image":    7,
+                "Used":     1,
+                "nValue":   0,
+                "sValue":   None,
+            },
+            self.FILTER_WORK_HOURS: {
+                "Name":     _("Filter work hours"),
+                "TypeName": "Custom",
+                "Options":  {"Custom": "1;%s" % "h"},
+                "Image":    7,
+                "Used":     0,
+                "nValue":   0,
+                "sValue":   0,
+            },
             self.UNIT_AIR_QUALITY_INDEX: {
                 "Name":     _("Air Quality Index"),
                 "TypeName": "Custom",
@@ -287,7 +336,7 @@ class BasePlugin:
             else:
                 Domoticz.Device(Name="Fan LED", Unit=self.UNIT_LED, TypeName="Switch", Image=7).Create()
 
-        self.onHeartbeat(fetch=False)
+            self.onHeartbeat(fetch=False)
 
     def onStop(self):
         Domoticz.Log("onStop called")
@@ -341,7 +390,7 @@ class BasePlugin:
                 self.myAir.set_mode(miio.airpurifier.OperationMode.Auto)
                 UpdateDevice(self.UNIT_MODE_CONTROL, 30, '30')
             elif Unit == self.UNIT_MOTOR_SPEED_FAVORITE:
-                self.myAir.set_favorite_level(str(int(int(Level)/10)))
+                self.myAir.set_favorite_level(int(int(Level)/10))
             elif Unit == self.UNIT_LED:
                 enabled = str(Command).upper() == "ON"
                 self.myAir.set_led(enabled)
@@ -435,7 +484,7 @@ class BasePlugin:
         # Set next pool time
         self.postponeNextPool(seconds=self.pollinterval)
         self.messageQueue.put({"Type": "Heartbeat", "fetch": fetch})
-    
+
     def onHeartbeatInternal(self, fetch=False):
         try:
             # check if another thread is not running
@@ -513,6 +562,23 @@ class BasePlugin:
             except KeyError:
                 pass  # No motor_speed value
 
+            try:
+                self.variables[self.FILTER_WORK_HOURS]['nValue'] = res.filter_hours_used
+                self.variables[self.FILTER_WORK_HOURS]['sValue'] = str(res.filter_hours_used)
+            except KeyError:
+                pass  # No filter_hours_used
+
+            try:
+                self.variables[self.FILTER_LIFE_REMAINING]['nValue'] = res.filter_life_remaining
+                self.variables[self.FILTER_LIFE_REMAINING]['sValue'] = str(res.filter_life_remaining)
+            except KeyError:
+                pass  # No filter_life_remaining
+
+            try:
+                self.variables[self.UNIT_ILLUMINANCE_SENSOR]['nValue'] = res.illuminance
+                self.variables[self.UNIT_ILLUMINANCE_SENSOR]['sValue'] = str(res.illuminance)
+            except KeyError:
+                pass  # No illuminance
 
             try:
                 if res.power == "on":
@@ -633,3 +699,4 @@ def UpdateDevice(Unit, nValue, sValue):
             Devices[Unit].Update(nValue=nValue, sValue=str(sValue))
             Domoticz.Log("Update " + str(nValue) + ":'" + str(sValue) + "' (" + Devices[Unit].Name + ")")
     return
+
